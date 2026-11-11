@@ -15,7 +15,8 @@ the service restarts or redeploys. Download any notes you want to keep.
 
 - Python 3.10 or later
 - An OpenRouter API key
-- Internet access when asking questions (the documents themselves stay local)
+- Internet access when asking questions; matching document passages are sent to
+  OpenRouter to generate an answer
 - Packages in `requirements.txt`
 
 Install the web server dependencies from the project directory:
@@ -63,11 +64,12 @@ per session. The sample documents count toward those limits. Confirmed notes are
 limited to 100 files and 5 MB total per session.
 
 Session cookies are HttpOnly and SameSite=Lax. They identify a browser session,
-not a user account. The session is created on the first API request (not for the
-homepage, static assets, or `/healthz`). At most 300 active session directories
-are allowed per app instance; new session requests receive HTTP 503 when the cap
-is reached. Idle sessions are removed after three hours by default. Override
-the timeout and local data root with:
+not a user account. Treat the cookie as a bearer token: anyone who obtains it
+may access that browser session. The session is created on the first API request
+(not for the homepage, static assets, or `/healthz`). At most 300 active
+session directories are allowed per app instance; new session requests receive
+HTTP 503 when the cap is reached. Idle sessions are removed after three hours
+by default. Override the timeout and local data root with:
 
 The API also applies an in-memory sliding-window limit of 10 requests per
 minute per session and per client IP. When deployed behind a proxy, configure
@@ -83,10 +85,19 @@ $env:OPENROUTER_MODEL = "liquid/lfm-3-1.7b:free"
 python -m uvicorn web_app:app --reload
 ```
 
-Set `FAQ_COOKIE_SECURE=true` when serving the app over HTTPS; leave it unset for
-local HTTP development. The data directory is instance-local and ephemeral:
-documents and notes can disappear when the server restarts or redeploys. The UI
-displays this warning, and users should download any notes they want to keep.
+Set `FAQ_COOKIE_SECURE=true` in the Render environment because the deployed app
+uses HTTPS. Confirm the browser session cookie includes the `Secure` attribute
+after deployment. Leave this variable unset for local HTTP development.
+
+When running locally, uploaded documents and notes are stored on your computer
+under the configured data directory. When hosted on Render, they are stored on
+the server in separate per-browser-session folders. Those files are not stored
+on the visitor's computer, and the session cookie is not a user account or a
+login. The hosted data directory is instance-local and ephemeral: documents and
+notes can disappear when the service restarts or redeploys. The UI displays
+this warning, and users should download any notes they want to keep. Matching
+passages from documents are sent to OpenRouter when a question is answered in
+both local and hosted use.
 
 The browser displays the answer, numbered source files, retrieved passages,
 any citation-number warnings, and an **Actions taken** trace with each action's
@@ -112,8 +123,8 @@ They do not remove secrets that were already committed or staged; check your
 Git status and history before publishing, and rotate any credential that may
 have been exposed.
 
-Search currently scores paragraphs by matching query terms. Answers are sent
-only the matching passages, with instructions to rely on those passages and
+Search currently scores paragraphs by matching query terms. Only the matching
+passages are sent to OpenRouter, with instructions to rely on those passages and
 cite the supporting source files together in one bracket when multiple files
 support the claim. If no passages match, the agent reports that it could not find
 relevant evidence rather than asking the model to answer without sources.
@@ -134,8 +145,8 @@ LIST_DOCS()
 - `ANSWER` asks the model to answer using the supplied passages. In an FAQ plan,
   use the special `$SEARCH_RESULTS` value for `passages`; the agent replaces it
   with the results from the preceding `SEARCH`.
-- `SAVE_NOTE` previews a note and saves it only after the user confirms. The
-  terminal offers to save each answer after displaying it.
+- `SAVE_NOTE` previews a note and saves it only after the user confirms. Both
+  the browser and terminal interfaces offer to save an answer after displaying it.
 - `LIST_DOCS` lists available supported documents.
 
 The FAQ agent parses the model output as command syntax, checks that commands
@@ -170,5 +181,9 @@ contents. Audit logs are excluded from Git by `.gitignore`.
 ## Run the tests
 
 ```powershell
+python -m pip install httpx2
 python -m unittest discover -s tests -v
 ```
+
+`httpx2` is needed by Starlette's `TestClient` for the web API tests; it is not
+needed to run the application itself.
