@@ -66,9 +66,10 @@ python -m uvicorn web_app:app --reload
 ```
 
 The browser displays the answer, numbered source files, retrieved passages,
-and any citation-number warnings. Use **Save answer as a note** to preview a
-note; it is written only after selecting **Save note** in the confirmation
-dialog.
+any citation-number warnings, and an **Actions taken** trace with each action's
+status, feedback, and execution time. The API also reports planning and total
+request timings. Use **Save answer as a note** to preview a note; it is written
+only after selecting **Save note** in the confirmation dialog.
 Uploaded documents are stored in the configured documents folder. After a note
 is saved, use the **Download note** link in the confirmation dialog to download
 the Markdown file.
@@ -126,6 +127,15 @@ The HTTP interface provides `GET /api/documents`, `POST /api/ask`, and
 `POST /api/notes`. The browser only communicates with this same-origin API;
 the OpenRouter key remains on the server and is read from
 `OPEN_ROUTER_API_KEY`.
+
+## Audit logging
+
+The app appends structured JSON Lines events to `logs/audit.jsonl` by default.
+Set `FAQ_AUDIT_LOG` to change the log file path. HTTP requests (including
+failures), FAQ asks, DSL command execution, and note save/confirmation outcomes
+are recorded with UTC timestamps and status metadata. The log intentionally
+does not include API keys, prompts, questions, answers, or document contents.
+Audit logs are excluded from Git by `.gitignore`.
 
 ## Run the tests
 

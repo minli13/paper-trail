@@ -11,10 +11,11 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Sequence
 
+from audit_log import AuditLogger
 from dsl_executor import Answer, DSLExecutor, Passage
 
 
@@ -36,6 +37,9 @@ class Operation:
 
     command: str
     arguments: tuple[object, ...]
+    status: str = "pending"
+    feedback: str = ""
+    duration_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -46,6 +50,21 @@ class FAQResponse:
     operations: tuple[Operation, ...]
     evidence: tuple[Passage, ...] = ()
     citation_warnings: tuple[str, ...] = ()
+    planning_duration_ms: float = 0.0
+
+
+class OperationExecutionError(RuntimeError):
+    """A DSL operation failed after a partial action trace was collected."""
+
+    def __init__(
+        self,
+        command: str,
+        operations: Sequence[Operation],
+        planning_duration_ms: float,
+    ) -> None:
+        super().__init__(f"{command} action failed")
+        self.operations = tuple(operations)
+        self.planning_duration_ms = planning_duration_ms
 
 
 class OpenRouterClient:
@@ -141,6 +160,7 @@ class FAQAgent:
         llm_call: Callable[[str], str] | None = None,
         preview_callback: Callable[[str], None] | None = None,
         confirm_callback: Callable[[str], bool] | None = None,
+        audit_logger: AuditLogger | None = None,
     ) -> None:
         self.llm_call = (
             llm_call
@@ -153,7 +173,9 @@ class FAQAgent:
             llm_call=self.llm_call,
             preview_callback=preview_callback,
             confirm_callback=confirm_callback,
+            audit_logger=audit_logger,
         )
+        self.audit_logger = audit_logger
 
     @staticmethod
     def parse_commands(response: str) -> list[Operation]:
@@ -234,6 +256,28 @@ class FAQAgent:
 
     def ask(self, question: str) -> FAQResponse:
         """Ask a question, interpret the LLM's DSL plan, and execute it."""
+        try:
+            response = self._ask(question)
+        except Exception as exc:
+            if self.audit_logger is not None:
+                self.audit_logger.log(
+                    "faq.ask",
+                    "failure",
+                    {
+                        "question_length": len(question) if isinstance(question, str) else 0,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+            raise
+        if self.audit_logger is not None:
+            self.audit_logger.log(
+                "faq.ask",
+                "success",
+                {"question_length": len(question)},
+            )
+        return response
+
+    def _ask(self, question: str) -> FAQResponse:
         if not isinstance(question, str) or not question.strip():
             raise ValueError("Question must be a non-empty string")
 
@@ -257,13 +301,17 @@ class FAQAgent:
             f"Available documents: {available_docs}\n"
             f"User question: {question.strip()}"
         )
+        planning_started = time.perf_counter()
+        model_plan = self.llm_call(planning_prompt)
         plan = [
             operation
-            for operation in self.parse_commands(self.llm_call(planning_prompt))
+            for operation in self.parse_commands(model_plan)
             if operation.command != "SAVE_NOTE"
         ]
+        planning_duration_ms = (time.perf_counter() - planning_started) * 1000
         last_search: list[Passage] | None = None
         last_answer: Answer | None = None
+        executed_operations: list[Operation] = []
 
         for operation in plan:
             if (
@@ -271,37 +319,79 @@ class FAQAgent:
                 and last_search is not None
                 and not last_search
             ):
+                executed_operations.append(
+                    replace(
+                        operation,
+                        status="skipped",
+                        feedback="Skipped because SEARCH found no relevant passages.",
+                    )
+                )
                 last_answer = Answer(
                     "I couldn't find relevant passages in the available documents.",
                     (),
                 )
                 break
-            arguments = self._resolve_arguments(
-                operation, last_search=last_search, last_answer=last_answer
+            operation_started = time.perf_counter()
+            try:
+                arguments = self._resolve_arguments(
+                    operation, last_search=last_search, last_answer=last_answer
+                )
+                dsl = f"{operation.command}({', '.join(repr(arg) for arg in arguments)})"
+                result = self.executor.execute(dsl)
+                if operation.command == "SEARCH":
+                    if not isinstance(result, list) or not all(
+                        isinstance(item, Passage) for item in result
+                    ):
+                        raise TypeError("SEARCH returned an unexpected result")
+                    last_search = result
+                    source_count = len({passage.source for passage in result})
+                    feedback = (
+                        f"Found {len(result)} passage(s) from {source_count} source(s)."
+                    )
+                elif operation.command == "ANSWER":
+                    if not isinstance(result, Answer):
+                        raise TypeError("ANSWER returned an unexpected result")
+                    last_answer = result
+                    feedback = (
+                        f"Generated an answer using {len(result.sources)} source(s)."
+                    )
+                else:
+                    feedback = "Completed successfully."
+            except Exception as exc:
+                duration_ms = (time.perf_counter() - operation_started) * 1000
+                executed_operations.append(
+                    replace(
+                        operation,
+                        status="failed",
+                        feedback=f"Action failed ({type(exc).__name__}).",
+                        duration_ms=duration_ms,
+                    )
+                )
+                raise OperationExecutionError(
+                    operation.command,
+                    executed_operations,
+                    planning_duration_ms,
+                ) from exc
+            executed_operations.append(
+                replace(
+                    operation,
+                    status="completed",
+                    feedback=feedback,
+                    duration_ms=(time.perf_counter() - operation_started) * 1000,
+                )
             )
-            dsl = f"{operation.command}({', '.join(repr(arg) for arg in arguments)})"
-            result = self.executor.execute(dsl)
-            if operation.command == "SEARCH":
-                if not isinstance(result, list) or not all(
-                    isinstance(item, Passage) for item in result
-                ):
-                    raise TypeError("SEARCH returned an unexpected result")
-                last_search = result
-            elif operation.command == "ANSWER":
-                if not isinstance(result, Answer):
-                    raise TypeError("ANSWER returned an unexpected result")
-                last_answer = result
 
         if last_answer is None:
             raise RuntimeError("FAQ plan did not produce an answer")
         evidence = tuple(last_search or ())
         return FAQResponse(
             answer=last_answer,
-            operations=tuple(plan),
+            operations=tuple(executed_operations),
             evidence=evidence,
             citation_warnings=self.validate_citations(
                 last_answer.text, last_answer.sources
             ),
+            planning_duration_ms=planning_duration_ms,
         )
 
     @staticmethod
@@ -338,7 +428,7 @@ class FAQAgent:
             "SAVE_NOTE": {1: "$ANSWER", 2: "$ANSWER_SOURCES"},
         }
         for index, value in enumerate(arguments):
-            if isinstance(value, str) and value.startswith("$"):
+            if isinstance(value, str) and re.fullmatch(r"\$[A-Z][A-Z0-9_]*", value):
                 expected = allowed_positions.get(command, {}).get(index)
                 if value not in _PLACEHOLDERS or value != expected:
                     raise ValueError(
@@ -499,12 +589,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             return False
         return response in {"y", "yes"}
 
+    audit_path = Path(
+        os.environ.get(
+            "FAQ_AUDIT_LOG", str(Path(__file__).resolve().parent / "logs" / "audit.jsonl")
+        )
+    )
+    audit_logger = AuditLogger(audit_path)
     agent = FAQAgent(
         documents_dir=args.documents,
         notes_dir=args.notes,
         model=args.model,
         preview_callback=show_preview,
         confirm_callback=confirm_note,
+        audit_logger=audit_logger,
     )
     try:
         return run_terminal(agent)

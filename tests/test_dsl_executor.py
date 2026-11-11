@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from audit_log import AuditLogger
 from dsl_executor import Answer, DSLExecutor, Passage
 
 
@@ -125,6 +126,25 @@ class DSLExecutorTests(unittest.TestCase):
 
         with self.assertRaisesRegex(TypeError, "sequence of source records"):
             executor.save_note("Review", "Key point", "policy.md")
+
+    def test_audit_log_records_command_outcomes_without_command_arguments(self) -> None:
+        audit_path = self.root / "audit.jsonl"
+        executor = DSLExecutor(
+            self.documents_dir,
+            self.notes_dir,
+            audit_logger=AuditLogger(audit_path),
+        )
+
+        executor.execute('SEARCH("private search query")')
+        with self.assertRaises(ValueError):
+            executor.execute('SEARCH(__import__("os").getcwd())')
+
+        events = audit_path.read_text(encoding="utf-8").splitlines()
+        self.assertIn('"command":"SEARCH"', events[0])
+        self.assertIn('"outcome":"success"', events[0])
+        self.assertIn('"command":"SEARCH"', events[1])
+        self.assertIn('"outcome":"failure"', events[1])
+        self.assertNotIn("private search query", audit_path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

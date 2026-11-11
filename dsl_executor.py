@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
+from audit_log import AuditLogger
+
 
 SUPPORTED_DOCUMENT_SUFFIXES = {".md", ".rst", ".txt"}
 
@@ -65,20 +67,41 @@ class DSLExecutor:
         llm_call: Callable[[str], str] | None = None,
         preview_callback: Callable[[str], None] | None = None,
         confirm_callback: Callable[[str], bool] | None = None,
+        audit_logger: AuditLogger | None = None,
     ) -> None:
         self.documents_dir = Path(documents_dir)
         self.notes_dir = Path(notes_dir)
         self.llm_call = llm_call
         self.preview_callback = preview_callback
         self.confirm_callback = confirm_callback
+        self.audit_logger = audit_logger
 
     def execute(self, action: str) -> object:
         """Parse and execute one DSL expression using literal-only arguments."""
+        command = "unknown"
+        try:
+            result, command = self._execute_action(action)
+        except Exception as exc:
+            if isinstance(action, str):
+                try:
+                    failed_expression = ast.parse(action, mode="eval").body
+                except SyntaxError:
+                    failed_expression = None
+                if (
+                    isinstance(failed_expression, ast.Call)
+                    and isinstance(failed_expression.func, ast.Name)
+                ):
+                    command = failed_expression.func.id
+            self._audit_command(command, "failure", type(exc).__name__)
+            raise
+        self._audit_command(command, "success")
+        return result
+
+    def _execute_action(self, action: str) -> tuple[object, str]:
         try:
             expression = ast.parse(action, mode="eval").body
         except SyntaxError as exc:
             raise ValueError("Invalid DSL expression") from exc
-
         if not isinstance(expression, ast.Call) or not isinstance(
             expression.func, ast.Name
         ):
@@ -102,7 +125,17 @@ class DSLExecutor:
         handler = handlers.get(expression.func.id)
         if handler is None:
             raise ValueError(f"Unknown DSL command: {expression.func.id}")
-        return handler(*arguments)
+        return handler(*arguments), expression.func.id
+
+    def _audit_command(
+        self, command: str, outcome: str, error_type: str | None = None
+    ) -> None:
+        if self.audit_logger is None:
+            return
+        metadata: dict[str, str] = {"command": command}
+        if error_type is not None:
+            metadata["error_type"] = error_type
+        self.audit_logger.log("dsl.command", outcome, metadata)
 
     def list_docs(self) -> list[DocumentInfo]:
         """List supported documents using paths relative to documents_dir."""
@@ -195,6 +228,37 @@ class DSLExecutor:
         confirm_callback: Callable[[str], bool] | None = None,
     ) -> SaveNoteResult:
         """Preview a note and save it only when the confirmation callback agrees."""
+        try:
+            result = self._save_note(
+                title,
+                content,
+                sources,
+                preview_callback=preview_callback,
+                confirm_callback=confirm_callback,
+            )
+        except Exception as exc:
+            source_count = (
+                len(sources)
+                if isinstance(sources, Sequence) and not isinstance(sources, (str, bytes))
+                else 0
+            )
+            self._audit_note("failure", source_count, type(exc).__name__)
+            raise
+        self._audit_note(
+            "saved" if result.saved_path is not None else "not_confirmed",
+            len(sources),
+        )
+        return result
+
+    def _save_note(
+        self,
+        title: str,
+        content: str,
+        sources: Sequence[str | Passage],
+        *,
+        preview_callback: Callable[[str], None] | None = None,
+        confirm_callback: Callable[[str], bool] | None = None,
+    ) -> SaveNoteResult:
         if not isinstance(title, str) or not title.strip():
             raise ValueError("SAVE_NOTE title must be a non-empty string")
         if not isinstance(content, str) or not content.strip():
@@ -221,6 +285,16 @@ class DSLExecutor:
             except FileExistsError:
                 continue
         raise FileExistsError("Could not allocate a unique note filename")
+
+    def _audit_note(
+        self, outcome: str, source_count: int, error_type: str | None = None
+    ) -> None:
+        if self.audit_logger is None:
+            return
+        metadata: dict[str, str | int] = {"source_count": source_count}
+        if error_type is not None:
+            metadata["error_type"] = error_type
+        self.audit_logger.log("note.save", outcome, metadata)
 
     def _documents_root(self) -> Path:
         root = self.documents_dir.resolve()

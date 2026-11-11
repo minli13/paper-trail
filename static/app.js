@@ -25,7 +25,9 @@ async function requestJson(url, options = {}) {
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(body.detail || `Request failed (${response.status})`);
+    const error = new Error(body.detail || `Request failed (${response.status})`);
+    error.payload = body;
+    throw error;
   }
   return body;
 }
@@ -73,6 +75,8 @@ function renderAnswer(result) {
   answer.className = "answer-text";
   answer.textContent = result.answer;
   answerPanel.append(kicker, answer);
+
+  renderActions(result.operations, result.timings);
 
   for (const warning of result.citation_warnings) {
     const warningBox = document.createElement("div");
@@ -127,6 +131,57 @@ function renderAnswer(result) {
   welcome.hidden = true;
 }
 
+function renderActions(operations = [], timings = {}) {
+  const section = document.createElement("section");
+  section.className = "actions-trace";
+  const heading = document.createElement("h3");
+  heading.className = "actions-heading";
+  heading.textContent = "Actions taken";
+  section.append(heading);
+
+  if (timings.total_ms !== undefined) {
+    const timingSummary = document.createElement("p");
+    timingSummary.className = "actions-timing";
+    timingSummary.textContent =
+      `Planning ${Number(timings.planning_ms || 0).toFixed(1)} ms · ` +
+      `Execution ${Number(timings.execution_ms || 0).toFixed(1)} ms · ` +
+      `Total ${Number(timings.total_ms).toFixed(1)} ms`;
+    section.append(timingSummary);
+  }
+
+  const list = document.createElement("ol");
+  list.className = "action-list";
+  for (const operation of operations) {
+    const item = document.createElement("li");
+    item.className = "action-item";
+    const row = document.createElement("div");
+    row.className = "action-row";
+    const command = document.createElement("span");
+    command.className = "action-command";
+    command.textContent = operation.command;
+    const status = document.createElement("span");
+    status.className = `action-status status-${operation.status}`;
+    status.textContent = operation.status;
+    const duration = document.createElement("span");
+    duration.className = "action-duration";
+    duration.textContent = `${Number(operation.duration_ms || 0).toFixed(1)} ms`;
+    row.append(command, status, duration);
+    const feedback = document.createElement("p");
+    feedback.className = "action-feedback";
+    feedback.textContent = operation.feedback || "";
+    item.append(row, feedback);
+    list.append(item);
+  }
+  if (!operations.length) {
+    const empty = document.createElement("li");
+    empty.className = "action-empty";
+    empty.textContent = "No actions completed.";
+    list.append(empty);
+  }
+  section.append(list);
+  answerPanel.append(section);
+}
+
 async function loadDocuments() {
   try {
     const result = await requestJson("/api/documents");
@@ -175,6 +230,12 @@ questionForm.addEventListener("submit", async (event) => {
     renderAnswer(result);
     questionInput.value = "";
   } catch (error) {
+    if (error.payload?.operations) {
+      answerPanel.replaceChildren();
+      renderActions(error.payload.operations, error.payload.timings);
+      answerPanel.hidden = false;
+      welcome.hidden = true;
+    }
     showError(error.message);
   } finally {
     loading.hidden = true;

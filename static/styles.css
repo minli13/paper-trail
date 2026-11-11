@@ -63,6 +63,20 @@ h1 { margin: 13px 0 12px; font-size: clamp(36px, 5vw, 55px); font-weight: 600; l
 .citation-warning { margin-top: 16px; padding: 10px 12px; color: #875232; background: #fbf1e7; border-radius: 8px; font-size: 12px; line-height: 1.55; }
 .sources { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 18px; }
 .source-chip { padding: 6px 9px; color: var(--green-dark); background: var(--green-soft); border-radius: 6px; font-size: 11px; }
+.actions-trace { margin-top: 20px; padding: 15px 16px; background: #f7f7f2; border: 1px solid var(--line); border-radius: 9px; }
+.actions-heading { margin: 0; color: #4f5449; font-size: 12px; font-weight: 700; }
+.actions-timing { margin: 6px 0 0; color: var(--muted); font-size: 10px; }
+.action-list { display: grid; gap: 10px; margin: 13px 0 0; padding: 0; list-style: none; }
+.action-item { padding-top: 10px; border-top: 1px solid #e8e8e0; }
+.action-row { display: flex; align-items: center; gap: 8px; }
+.action-command { color: #34392f; font-family: Consolas, monospace; font-size: 11px; font-weight: 700; }
+.action-status { padding: 3px 7px; border-radius: 12px; font-size: 9px; font-weight: 700; text-transform: uppercase; }
+.status-completed { color: #486343; background: #e6eee2; }
+.status-skipped { color: #745e35; background: #f5eedb; }
+.status-failed { color: #8c4838; background: #f9eae5; }
+.action-duration { margin-left: auto; color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.action-feedback { margin: 5px 0 0; color: #777a70; font-size: 11px; line-height: 1.5; }
+.action-empty { color: var(--muted); font-size: 11px; }
 .evidence { margin-top: 19px; border-top: 1px solid var(--line); }
 .evidence summary { padding: 14px 0 2px; color: #63675c; cursor: pointer; font-size: 12px; font-weight: 600; }
 .passage { margin-top: 12px; padding: 12px 14px; background: #f6f6f1; border-radius: 8px; }

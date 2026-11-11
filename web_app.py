@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import time
 from urllib.parse import urlencode
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
@@ -11,8 +12,9 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from audit_log import AuditLogger
 from dsl_executor import SUPPORTED_DOCUMENT_SUFFIXES
-from faq_agent import DEFAULT_MODEL, FAQAgent
+from faq_agent import DEFAULT_MODEL, FAQAgent, Operation, OperationExecutionError
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -31,18 +33,54 @@ class SaveNoteRequest(BaseModel):
     confirmed: bool = False
 
 
-def create_app(agent: FAQAgent | None = None) -> FastAPI:
+def create_app(
+    agent: FAQAgent | None = None,
+    audit_logger: AuditLogger | None = None,
+) -> FastAPI:
     """Create the API and frontend app, optionally with an injected agent."""
+    audit_path = Path(
+        os.environ.get(
+            "FAQ_AUDIT_LOG",
+            str(PROJECT_ROOT / "logs" / "audit.jsonl"),
+        )
+    )
+    audit = audit_logger or AuditLogger(audit_path)
     faq_agent = agent or FAQAgent(
         documents_dir=Path(
             os.environ.get("FAQ_DOCUMENTS_DIR", str(PROJECT_ROOT / "documents"))
         ),
         notes_dir=Path(os.environ.get("FAQ_NOTES_DIR", str(PROJECT_ROOT / "notes"))),
         model=os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL),
+        audit_logger=audit,
     )
+    faq_agent.audit_logger = audit
+    faq_agent.executor.audit_logger = audit
     app = FastAPI(title="Paper Trail", version="1.0.0")
     app.state.faq_agent = faq_agent
+    app.state.audit_logger = audit
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    @app.middleware("http")
+    async def audit_requests(request, call_next):
+        started = time.monotonic()
+        status_code = 500
+        outcome = "failure"
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            outcome = "success" if status_code < 400 else "failure"
+            return response
+        finally:
+            audit.log(
+                "http.request",
+                outcome,
+                {
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status_code": status_code,
+                    "duration_ms": round((time.monotonic() - started) * 1000, 2),
+                },
+            )
 
     def documents_root() -> Path:
         return faq_agent.executor.documents_dir.resolve()
@@ -117,16 +155,35 @@ def create_app(agent: FAQAgent | None = None) -> FastAPI:
             raise HTTPException(status_code=500, detail="Could not store document") from exc
         raise HTTPException(status_code=409, detail="Could not allocate a unique filename")
 
-    @app.post("/api/ask")
-    def ask(request: AskRequest) -> dict[str, object]:
+    @app.post("/api/ask", response_model=None)
+    def ask(request: AskRequest) -> dict[str, object] | JSONResponse:
         question = request.question.strip()
         if not question:
             raise HTTPException(status_code=422, detail="Question must not be blank")
+        started = time.perf_counter()
         try:
             result = faq_agent.ask(question)
+        except OperationExecutionError as exc:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "detail": str(exc.__cause__ or exc),
+                    "operations": [_operation_payload(item) for item in exc.operations],
+                    "timings": {
+                        "planning_ms": round(exc.planning_duration_ms, 2),
+                        "execution_ms": round(
+                            sum(item.duration_ms for item in exc.operations), 2
+                        ),
+                        "total_ms": round(elapsed_ms, 2),
+                    },
+                },
+            )
         except (RuntimeError, ValueError, OSError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+        operations = [_operation_payload(item) for item in result.operations]
+        execution_ms = sum(item.duration_ms for item in result.operations)
         return {
             "answer": result.answer.text,
             "sources": list(result.answer.sources),
@@ -139,6 +196,12 @@ def create_app(agent: FAQAgent | None = None) -> FastAPI:
                 }
                 for passage in result.evidence
             ],
+            "operations": operations,
+            "timings": {
+                "planning_ms": round(result.planning_duration_ms, 2),
+                "execution_ms": round(execution_ms, 2),
+                "total_ms": round((time.perf_counter() - started) * 1000, 2),
+            },
         }
 
     @app.post("/api/notes")
@@ -198,6 +261,16 @@ def create_app(agent: FAQAgent | None = None) -> FastAPI:
         )
 
     return app
+
+
+def _operation_payload(operation: Operation) -> dict[str, object]:
+    """Expose action status without returning potentially sensitive arguments."""
+    return {
+        "command": operation.command,
+        "status": operation.status,
+        "feedback": operation.feedback,
+        "duration_ms": round(operation.duration_ms, 2),
+    }
 
 
 app = create_app()

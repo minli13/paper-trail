@@ -1,9 +1,11 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from audit_log import AuditLogger
 from faq_agent import FAQAgent
 from web_app import create_app
 
@@ -33,7 +35,10 @@ class WebAppTests(unittest.TestCase):
             self.notes_dir,
             llm_call=fake_llm,
         )
-        self.client = TestClient(create_app(agent))
+        self.audit_path = self.root / "audit.jsonl"
+        self.client = TestClient(
+            create_app(agent, audit_logger=AuditLogger(self.audit_path))
+        )
 
     def tearDown(self) -> None:
         self.client.close()
@@ -47,6 +52,7 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Paper Trail", page.text)
         self.assertEqual(script.status_code, 200)
         self.assertIn("/api/ask", script.text)
+        self.assertIn("Actions taken", script.text)
 
     def test_documents_and_ask_api(self) -> None:
         documents = self.client.get("/api/documents")
@@ -60,9 +66,75 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(response.json()["answer"], "Keep records for seven years. [1]")
         self.assertEqual(response.json()["sources"], ["policy.md"])
         self.assertEqual(
+            [item["command"] for item in response.json()["operations"]],
+            ["SEARCH", "ANSWER"],
+        )
+        self.assertEqual(
+            [item["status"] for item in response.json()["operations"]],
+            ["completed", "completed"],
+        )
+        self.assertTrue(
+            all(item["duration_ms"] >= 0 for item in response.json()["operations"])
+        )
+        self.assertTrue(
+            all(
+                item["feedback"]
+                for item in response.json()["operations"]
+            )
+        )
+        self.assertEqual(
+            set(response.json()["timings"]),
+            {"planning_ms", "execution_ms", "total_ms"},
+        )
+        self.assertTrue(
+            all("arguments" not in item for item in response.json()["operations"])
+        )
+        self.assertEqual(
             response.json()["evidence"][0]["text"],
             "Keep records for seven years.",
         )
+        audit_contents = self.audit_path.read_text(encoding="utf-8")
+        events = [json.loads(line) for line in audit_contents.splitlines()]
+        actions = {event["action"] for event in events}
+        self.assertIn("faq.ask", actions)
+        self.assertIn("dsl.command", actions)
+        self.assertIn("http.request", actions)
+        self.assertNotIn("How long should records be kept?", audit_contents)
+        self.assertNotIn("Keep records for seven years. [1]", audit_contents)
+
+    def test_api_returns_partial_action_trace_when_operation_fails(self) -> None:
+        def failing_llm(prompt: str) -> str:
+            if "action planner" in prompt:
+                return (
+                    'SEARCH("seven years")\n'
+                    'ANSWER("How long?", "$SEARCH_RESULTS")'
+                )
+            raise RuntimeError("model unavailable")
+
+        failing_agent = FAQAgent(
+            self.documents_dir,
+            self.notes_dir,
+            llm_call=failing_llm,
+        )
+        client = TestClient(
+            create_app(
+                failing_agent,
+                audit_logger=AuditLogger(self.root / "failed-audit.jsonl"),
+            )
+        )
+        try:
+            response = client.post("/api/ask", json={"question": "How long?"})
+        finally:
+            client.close()
+
+        self.assertEqual(response.status_code, 502)
+        body = response.json()
+        self.assertEqual(
+            [item["status"] for item in body["operations"]],
+            ["completed", "failed"],
+        )
+        self.assertIn("RuntimeError", body["operations"][1]["feedback"])
+        self.assertGreaterEqual(body["timings"]["total_ms"], 0)
 
     def test_note_preview_does_not_save_until_confirmed(self) -> None:
         note = {
@@ -84,6 +156,15 @@ class WebAppTests(unittest.TestCase):
         self.assertTrue(saved.json()["saved"])
         self.assertIn("Keep records for seven years.", saved.json()["preview"])
         self.assertTrue((self.notes_dir / saved.json()["filename"]).is_file())
+        events = [
+            json.loads(line)
+            for line in self.audit_path.read_text(encoding="utf-8").splitlines()
+        ]
+        note_events = [event for event in events if event["action"] == "note.save"]
+        self.assertEqual(
+            [event["outcome"] for event in note_events],
+            ["not_confirmed", "saved"],
+        )
 
     def test_note_api_rejects_unknown_sources(self) -> None:
         response = self.client.post(

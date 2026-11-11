@@ -47,7 +47,6 @@ class FAQAgentTests(unittest.TestCase):
             'SEARCH(query="Runeterra", max_results=3)\n'
             'ANSWER(question="What is Runeterra?", passages="$SEARCH_RESULTS")'
         )
-
         self.assertEqual(
             operations,
             [
@@ -58,6 +57,21 @@ class FAQAgentTests(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_parser_allows_currency_text_in_search_query(self) -> None:
+        operations = FAQAgent.parse_commands(
+            'SEARCH("$60 meal limit")\n'
+            'ANSWER("What is the meal limit?", "$SEARCH_RESULTS")'
+        )
+
+        self.assertEqual(operations[0], Operation("SEARCH", ("$60 meal limit",)))
+
+    def test_parser_rejects_unknown_placeholder_tokens(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Placeholder"):
+            FAQAgent.parse_commands(
+                'SEARCH("$UNKNOWN_TOKEN")\n'
+                'ANSWER("Question?", "$SEARCH_RESULTS")'
+            )
 
     def test_parser_rejects_unknown_or_duplicate_keyword_arguments(self) -> None:
         with self.assertRaisesRegex(ValueError, "does not accept argument"):
