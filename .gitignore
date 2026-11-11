@@ -36,6 +36,7 @@ documents/*
 # Logs and operating-system files
 *.log
 logs/
+/data/
 .DS_Store
 Thumbs.db
 Desktop.ini

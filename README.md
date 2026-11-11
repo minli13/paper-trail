@@ -48,38 +48,46 @@ Open <http://127.0.0.1:8000> in your browser. The browser UI replaces the
 interactive CLI as the primary interface. The old CLI remains available with
 `python .\faq_agent.py`.
 
-By default, the web app:
+The web app stores each browser session separately under
+`data/sessions/<session-id>/documents` and `data/sessions/<session-id>/notes`.
+It seeds each new session with the three sample documents in `documents/`.
+Uploaded `.md`, `.rst`, and `.txt` files must be UTF-8 text and are limited to
+5 MB each, 50 supported documents per session, and 25 MB total document storage
+per session. The sample documents count toward those limits.
 
-- Reads `.md`, `.rst`, and `.txt` files from `.\documents`; upload documents
-  from the sidebar (UTF-8 text, up to 5 MB per file).
-- Uses the model configured in `faq_agent.py` (override with
-  `OPENROUTER_MODEL`).
-- Saves confirmed notes to `.\notes`.
-
-Override the document folder, notes folder, or model with environment variables:
+Session cookies are HttpOnly and SameSite=Lax. They identify a browser session,
+not a user account. Sessions are removed after three idle hours by default;
+override the timeout and local data root with:
 
 ```powershell
-$env:FAQ_DOCUMENTS_DIR = ".\my-docs"
-$env:FAQ_NOTES_DIR = ".\my-notes"
+$env:FAQ_SESSION_IDLE_HOURS = "3"
+$env:FAQ_DATA_DIR = ".\data"
+$env:FAQ_COOKIE_SECURE = "true"
 $env:OPENROUTER_MODEL = "liquid/lfm-3-1.7b:free"
 python -m uvicorn web_app:app --reload
 ```
+
+Set `FAQ_COOKIE_SECURE=true` when serving the app over HTTPS; leave it unset for
+local HTTP development. The data directory is instance-local and ephemeral:
+documents and notes can disappear when the server restarts or redeploys. The UI
+displays this warning, and users should download any notes they want to keep.
 
 The browser displays the answer, numbered source files, retrieved passages,
 any citation-number warnings, and an **Actions taken** trace with each action's
 status, feedback, and execution time. The API also reports planning and total
 request timings. Use **Save answer as a note** to preview a note; it is written
 only after selecting **Save note** in the confirmation dialog.
-Uploaded documents are stored in the configured documents folder. After a note
-is saved, use the **Download note** link in the confirmation dialog to download
-the Markdown file.
+In the browser app, uploads and notes are stored in the current session's
+folders, not in the repository's `documents/` and `notes/` directories. After a
+note is saved, use the **Download note** link in the confirmation dialog to
+download the Markdown file before the session or server is cleared.
 
 ## Add your own documents
 
 Place text-based `.md`, `.rst`, or `.txt` files in `documents` (or the folder
-passed with `--documents`). Subdirectories are searched too. The sample
-documents in that folder are fictional and are included for trying out the
-agent. The repository's `.gitignore` excludes other files in `documents/`,
+passed with `--documents`). Subdirectories are searched too. The three
+documents seeded into browser sessions are fictional examples for trying out
+the agent. The repository's `.gitignore` excludes other files in `documents/`,
 including your uploaded documents, and excludes generated notes. This helps
 prevent publishing private document content when pushing the project.
 
@@ -123,9 +131,10 @@ commands' positional order. A valid FAQ plan must include `SEARCH` and
 and shows both the answer and retrieved passages. The DSL executor performs the
 local search and note writing; note writing requires an explicit confirmation.
 
-The HTTP interface provides `GET /api/documents`, `POST /api/ask`, and
-`POST /api/notes`. The browser only communicates with this same-origin API;
-the OpenRouter key remains on the server and is read from
+The HTTP interface provides `GET`, `POST`, and `DELETE /api/documents`,
+`POST /api/ask`, and `POST /api/notes`. Deleting a document returns `204 No
+Content` with an empty body. The browser only communicates with this same-origin
+API; the OpenRouter key remains on the server and is read from
 `OPEN_ROUTER_API_KEY`.
 
 ## Audit logging

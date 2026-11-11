@@ -2,24 +2,30 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager, suppress
 import os
 from pathlib import Path
 import time
 from urllib.parse import urlencode
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from audit_log import AuditLogger
 from dsl_executor import SUPPORTED_DOCUMENT_SUFFIXES
 from faq_agent import DEFAULT_MODEL, FAQAgent, Operation, OperationExecutionError
+from session_store import SessionStore, UserSession
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 STATIC_DIR = PROJECT_ROOT / "static"
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+MAX_SESSION_DOCUMENTS = 50
+MAX_SESSION_STORAGE_BYTES = 25 * 1024 * 1024
+SESSION_COOKIE_NAME = "paper_trail_session"
 
 
 class AskRequest(BaseModel):
@@ -36,8 +42,36 @@ class SaveNoteRequest(BaseModel):
 def create_app(
     agent: FAQAgent | None = None,
     audit_logger: AuditLogger | None = None,
+    sample_documents_dir: str | Path | None = None,
+    data_dir: str | Path | None = None,
 ) -> FastAPI:
     """Create the API and frontend app, optionally with an injected agent."""
+    idle_timeout_seconds = float(os.environ.get("FAQ_SESSION_IDLE_HOURS", "3")) * 60 * 60
+    store = SessionStore(
+        data_dir=data_dir
+        or os.environ.get("FAQ_DATA_DIR", str(PROJECT_ROOT / "data")),
+        sample_documents_dir=sample_documents_dir or PROJECT_ROOT / "documents",
+        idle_timeout_seconds=idle_timeout_seconds,
+    )
+    cleanup_interval_seconds = max(
+        60.0, min(idle_timeout_seconds / 4, 15 * 60)
+    )
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        async def cleanup_loop() -> None:
+            while True:
+                await asyncio.sleep(cleanup_interval_seconds)
+                await asyncio.to_thread(store.cleanup_idle)
+
+        cleanup_task = asyncio.create_task(cleanup_loop())
+        try:
+            yield
+        finally:
+            cleanup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await cleanup_task
+
     audit_path = Path(
         os.environ.get(
             "FAQ_AUDIT_LOG",
@@ -45,32 +79,46 @@ def create_app(
         )
     )
     audit = audit_logger or AuditLogger(audit_path)
-    faq_agent = agent or FAQAgent(
-        documents_dir=Path(
-            os.environ.get("FAQ_DOCUMENTS_DIR", str(PROJECT_ROOT / "documents"))
-        ),
-        notes_dir=Path(os.environ.get("FAQ_NOTES_DIR", str(PROJECT_ROOT / "notes"))),
-        model=os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL),
-        audit_logger=audit,
-    )
-    faq_agent.audit_logger = audit
-    faq_agent.executor.audit_logger = audit
-    app = FastAPI(title="Paper Trail", version="1.0.0")
-    app.state.faq_agent = faq_agent
+    app = FastAPI(title="Paper Trail", version="1.0.0", lifespan=lifespan)
+    app.state.agent_prototype = agent
+    app.state.session_store = store
     app.state.audit_logger = audit
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    def session_agent(session: UserSession) -> FAQAgent:
+        prototype = app.state.agent_prototype
+        return FAQAgent(
+            documents_dir=session.documents_dir,
+            notes_dir=session.notes_dir,
+            model=os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL),
+            llm_call=prototype.llm_call if prototype is not None else None,
+            audit_logger=audit,
+        )
 
     @app.middleware("http")
     async def audit_requests(request, call_next):
         started = time.monotonic()
         status_code = 500
         outcome = "failure"
+        session = store.open_session(request.cookies.get(SESSION_COOKIE_NAME))
+        request.state.user_session = session
         try:
             response = await call_next(request)
             status_code = response.status_code
             outcome = "success" if status_code < 400 else "failure"
+            response.set_cookie(
+                SESSION_COOKIE_NAME,
+                session.session_id,
+                max_age=int(idle_timeout_seconds),
+                httponly=True,
+                samesite="lax",
+                secure=os.environ.get("FAQ_COOKIE_SECURE", "false").casefold()
+                in {"1", "true", "yes"},
+                path="/",
+            )
             return response
         finally:
+            store.touch(session)
             audit.log(
                 "http.request",
                 outcome,
@@ -82,18 +130,19 @@ def create_app(
                 },
             )
 
-    def documents_root() -> Path:
-        return faq_agent.executor.documents_dir.resolve()
+    def documents_root(session: UserSession) -> Path:
+        return session.documents_dir.resolve()
 
-    def notes_root() -> Path:
-        return faq_agent.executor.notes_dir.resolve()
+    def notes_root(session: UserSession) -> Path:
+        return session.notes_dir.resolve()
 
     @app.get("/", include_in_schema=False)
     def index() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
 
     @app.get("/api/documents")
-    def list_documents() -> dict[str, list[str]]:
+    def list_documents(request: Request) -> dict[str, list[str]]:
+        faq_agent = session_agent(request.state.user_session)
         try:
             documents = faq_agent.executor.list_docs()
         except (OSError, ValueError) as exc:
@@ -101,7 +150,11 @@ def create_app(
         return {"documents": [document.name for document in documents]}
 
     @app.post("/api/documents")
-    async def upload_document(file: UploadFile = File(...)) -> dict[str, object]:
+    async def upload_document(
+        request: Request,
+        file: UploadFile = File(...),
+    ) -> dict[str, object]:
+        faq_agent = session_agent(request.state.user_session)
         original_name = file.filename or ""
         filename = Path(original_name.replace("\\", "/")).name
         suffix = Path(filename).suffix.casefold()
@@ -133,12 +186,27 @@ def create_app(
                 status_code=415, detail="Document must be UTF-8 encoded text"
             ) from exc
 
-        root = documents_root()
+        root = documents_root(request.state.user_session)
         try:
             root.mkdir(parents=True, exist_ok=True)
             if not root.is_dir():
                 raise HTTPException(
                     status_code=500, detail="Document directory is unavailable"
+                )
+            current_documents = faq_agent.executor.list_docs()
+            if len(current_documents) >= MAX_SESSION_DOCUMENTS:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Session document limit is {MAX_SESSION_DOCUMENTS} files",
+                )
+            current_size = sum(
+                (root / document.name).stat().st_size
+                for document in current_documents
+            )
+            if current_size + len(data) > MAX_SESSION_STORAGE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Session document storage limit is 25 MB",
                 )
             for index in range(1, 10000):
                 candidate_name = (
@@ -155,9 +223,33 @@ def create_app(
             raise HTTPException(status_code=500, detail="Could not store document") from exc
         raise HTTPException(status_code=409, detail="Could not allocate a unique filename")
 
+    @app.delete("/api/documents/{filename}", status_code=204)
+    def delete_document(request: Request, filename: str) -> Response:
+        faq_agent = session_agent(request.state.user_session)
+        if (
+            not filename
+            or Path(filename.replace("\\", "/")).name != filename
+            or Path(filename).suffix.casefold() not in SUPPORTED_DOCUMENT_SUFFIXES
+        ):
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        root = documents_root(request.state.user_session)
+        document_path = (root / filename).resolve()
+        if document_path.parent != root or not document_path.is_file():
+            audit.log("document.delete", "not_found")
+            raise HTTPException(status_code=404, detail="Document not found")
+        try:
+            document_path.unlink()
+        except OSError as exc:
+            audit.log("document.delete", "failure")
+            raise HTTPException(status_code=500, detail="Could not remove document") from exc
+        audit.log("document.delete", "deleted")
+        return Response(status_code=204)
+
     @app.post("/api/ask", response_model=None)
-    def ask(request: AskRequest) -> dict[str, object] | JSONResponse:
-        question = request.question.strip()
+    def ask(request: Request, body: AskRequest) -> dict[str, object] | JSONResponse:
+        faq_agent = session_agent(request.state.user_session)
+        question = body.question.strip()
         if not question:
             raise HTTPException(status_code=422, detail="Question must not be blank")
         started = time.perf_counter()
@@ -205,9 +297,10 @@ def create_app(
         }
 
     @app.post("/api/notes")
-    def save_note(request: SaveNoteRequest) -> dict[str, object]:
-        title = request.title.strip()
-        content = request.content.strip()
+    def save_note(request: Request, body: SaveNoteRequest) -> dict[str, object]:
+        faq_agent = session_agent(request.state.user_session)
+        title = body.title.strip()
+        content = body.content.strip()
         if not title or not content:
             raise HTTPException(
                 status_code=422, detail="Note title and content must not be blank"
@@ -216,7 +309,7 @@ def create_app(
             available_sources = {
                 document.name for document in faq_agent.executor.list_docs()
             }
-            unknown_sources = sorted(set(request.sources) - available_sources)
+            unknown_sources = sorted(set(body.sources) - available_sources)
             if unknown_sources:
                 raise HTTPException(
                     status_code=422,
@@ -225,8 +318,8 @@ def create_app(
             result = faq_agent.executor.save_note(
                 title,
                 content,
-                request.sources,
-                confirm_callback=lambda _: request.confirmed,
+                body.sources,
+                confirm_callback=lambda _: body.confirmed,
             )
         except HTTPException:
             raise
@@ -246,11 +339,12 @@ def create_app(
 
     @app.get("/api/notes/download")
     def download_note(
+        request: Request,
         filename: str = Query(min_length=1, max_length=255),
     ) -> FileResponse:
         if Path(filename).name != filename or not filename.casefold().endswith(".md"):
             raise HTTPException(status_code=404, detail="Note not found")
-        root = notes_root()
+        root = notes_root(request.state.user_session)
         note_path = (root / filename).resolve()
         if note_path.parent != root or not note_path.is_file():
             raise HTTPException(status_code=404, detail="Note not found")

@@ -30,9 +30,14 @@ button { cursor: pointer; }
 .upload-hint { margin: 7px 2px 12px; color: #92948a; font-size: 10px; line-height: 1.45; }
 .document-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
 .document-item { display: flex; align-items: flex-start; gap: 10px; padding: 10px 9px; color: #45483f; border-radius: 8px; font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+.document-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.remove-document { flex: 0 0 auto; padding: 0 4px; color: #777a70; background: transparent; border: 0; border-radius: 4px; font-size: 17px; line-height: 1; }
+.remove-document:hover, .remove-document:focus-visible { color: #8c4838; background: #f9eae5; }
+.remove-document:disabled { cursor: wait; opacity: .5; }
 .file-icon { flex: 0 0 auto; color: var(--orange); font-size: 14px; }
 .empty-library { padding: 10px; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .sidebar-hint { margin: auto 5px 18px; padding-top: 20px; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.temporary-notice { margin: 0 5px 17px; padding: 10px; color: #725d39; background: #f5eedb; border-radius: 7px; font-size: 10px; line-height: 1.55; }
 .sidebar-footer { display: flex; align-items: center; gap: 8px; padding: 13px 5px 0; border-top: 1px solid #deddd5; color: var(--muted); font-size: 11px; }
 .status-dot { width: 7px; height: 7px; background: #79956d; border-radius: 50%; }
 .main-content { display: flex; flex-direction: column; min-width: 0; min-height: 100vh; }
@@ -119,9 +124,10 @@ h1 { margin: 13px 0 12px; font-size: clamp(36px, 5vw, 55px); font-weight: 600; l
   .upload-button { width: auto; align-self: flex-start; padding: 7px 10px; font-size: 11px; }
   .upload-hint { margin: 5px 2px 8px; }
   .document-list { display: flex; max-height: 80px; overflow: auto; }
-  .document-item { flex: 0 0 auto; max-width: 190px; padding: 6px 8px; background: #e9e8e1; font-size: 10px; }
+  .document-item { flex: 0 0 auto; max-width: 220px; padding: 6px 8px; background: #e9e8e1; font-size: 10px; }
   .empty-library { padding: 6px 4px; }
   .sidebar-hint, .sidebar-footer { display: none; }
+  .temporary-notice { margin: 4px 1px 8px; padding: 7px 9px; font-size: 9px; }
   .main-content { min-height: calc(100vh - 125px); }
   .topbar { height: 52px; padding: 0 18px; }
   .workspace { width: calc(100% - 30px); padding: 25px 0 16px; }

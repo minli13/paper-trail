@@ -61,8 +61,34 @@ function renderDocuments(names) {
     icon.textContent = "▤";
     const label = document.createElement("span");
     label.textContent = name;
-    item.append(icon, label);
+    label.className = "document-name";
+    const removeButton = document.createElement("button");
+    removeButton.type = "button";
+    removeButton.className = "remove-document";
+    removeButton.textContent = "×";
+    removeButton.setAttribute("aria-label", `Remove ${name}`);
+    removeButton.title = `Remove ${name}`;
+    removeButton.addEventListener("click", () => removeDocument(name, removeButton));
+    item.append(icon, label, removeButton);
     documentList.append(item);
+  }
+}
+
+async function removeDocument(name, button) {
+  button.disabled = true;
+  clearError();
+  try {
+    const response = await fetch(`/api/documents/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.detail || `Remove failed (${response.status})`);
+    }
+    await loadDocuments();
+  } catch (error) {
+    button.disabled = false;
+    showError(`Could not remove ${name}: ${error.message}`);
   }
 }
 
