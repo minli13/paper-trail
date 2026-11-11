@@ -1,0 +1,40 @@
+# Environment variables and credentials
+.env
+.env.*
+!.env.example
+*.secret
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+service-account*.json
+secrets/
+
+# Python environments, bytecode, and test/tool caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# User-created notes
+notes/*
+!notes/.gitkeep
+
+# Local documents: retain only the fictional starter examples
+documents/*
+!documents/employee-handbook.md
+!documents/security-faq.md
+!documents/travel-policy.txt
+
+# Logs and operating-system files
+*.log
+.DS_Store
+Thumbs.db
+Desktop.ini

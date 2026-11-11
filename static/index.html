@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f5f4f0">
+    <title>Paper Trail</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Document library">
+        <a class="brand" href="/" aria-label="Paper Trail home">
+          <span class="brand-mark" aria-hidden="true">P</span>
+          <span>paper trail</span>
+        </a>
+        <div class="library-heading">
+          <span class="eyebrow">YOUR LIBRARY</span>
+          <span id="document-count" class="count-pill">0</span>
+        </div>
+        <label class="upload-button" for="document-upload">
+          <span aria-hidden="true">＋</span> Add documents
+        </label>
+        <input id="document-upload" class="sr-only" type="file" accept=".md,.rst,.txt,text/plain,text/markdown" multiple>
+        <p class="upload-hint">Markdown, reStructuredText, or plain text · up to 5 MB each</p>
+        <ul id="document-list" class="document-list" aria-live="polite"></ul>
+        <p class="sidebar-hint">Answers are grounded in the documents you add to your library.</p>
+        <div class="sidebar-footer">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span>Private local library</span>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar">
+          <span class="eyebrow">DOCUMENT ASSISTANT</span>
+          <span class="model-badge"><span aria-hidden="true">✦</span> OpenRouter AI</span>
+        </header>
+
+        <section class="workspace">
+          <div class="welcome" id="welcome">
+            <div class="welcome-icon" aria-hidden="true">✳</div>
+            <p class="eyebrow">YOUR RESEARCH DESK</p>
+            <h1>Find the thread<br>in your documents.</h1>
+            <p class="welcome-copy">Ask a question. Get a clear answer with the sources and passages that support it.</p>
+            <div class="suggestions" aria-label="Example questions">
+              <button type="button" class="suggestion">What topics are covered in my documents?</button>
+              <button type="button" class="suggestion">Summarize the key points</button>
+            </div>
+          </div>
+
+          <section id="answer-panel" class="answer-panel" hidden aria-live="polite"></section>
+
+          <div id="error-banner" class="error-banner" role="alert" hidden></div>
+          <div id="loading" class="loading" hidden>
+            <span class="spinner" aria-hidden="true"></span>
+            <span>Looking through your documents…</span>
+          </div>
+
+          <form id="question-form" class="composer">
+            <label for="question-input" class="sr-only">Ask a question about your documents</label>
+            <textarea id="question-input" rows="1" maxlength="4000" placeholder="Ask anything about your documents…" required></textarea>
+            <button id="ask-button" class="send-button" type="submit" aria-label="Ask question">
+              <span aria-hidden="true">↑</span>
+            </button>
+            <div class="composer-caption">Answers are generated from your local documents</div>
+          </form>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="note-dialog" class="note-dialog">
+      <form method="dialog" id="note-form">
+        <div class="dialog-header">
+          <div>
+            <p class="eyebrow">KEEP THIS ANSWER</p>
+            <h2>Save as a note</h2>
+          </div>
+          <button type="button" id="close-note" class="icon-button" aria-label="Close">×</button>
+        </div>
+        <label for="note-title">Note title</label>
+        <input id="note-title" name="title" maxlength="200" required>
+        <div class="preview-heading">PREVIEW</div>
+        <pre id="note-preview" class="note-preview"></pre>
+        <p id="note-status" class="note-status" aria-live="polite"></p>
+        <a id="download-note" class="download-button" hidden>Download note</a>
+        <div class="dialog-actions">
+          <button type="button" id="cancel-note" class="secondary-button">Cancel</button>
+          <button type="button" id="confirm-note" class="primary-button">Save note</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

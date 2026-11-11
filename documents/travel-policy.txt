@@ -1,0 +1,11 @@
+SAMPLE TRAVEL POLICY
+This fictional policy exists only to help test the FAQ agent.
+
+Booking: Get manager approval before booking work travel. Use the lowest
+reasonable fare that meets the business schedule.
+
+Meals: The sample meal reimbursement limit is $60 per travel day. Keep itemized
+receipts for reimbursable meals.
+
+Submitting expenses: Submit travel expenses within 30 days after returning.
+Include receipts and a brief business purpose for each expense.
