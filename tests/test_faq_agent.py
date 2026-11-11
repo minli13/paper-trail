@@ -9,6 +9,7 @@ from faq_agent import (
     DEFAULT_MODEL,
     FAQAgent,
     OpenRouterClient,
+    OpenRouterRateLimitError,
     Operation,
     run_terminal,
 )
@@ -233,13 +234,12 @@ class FAQAgentTests(unittest.TestCase):
             "faq_agent.urllib.request.urlopen",
             side_effect=[rate_limit(), rate_limit()],
         ) as urlopen:
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "rate limit reached \\(HTTP 429\\).*quota exhausted",
-            ):
+            with self.assertRaises(OpenRouterRateLimitError) as raised:
                 client("test prompt")
 
         self.assertEqual(urlopen.call_count, 2)
+        self.assertIn("wait a moment", str(raised.exception))
+        self.assertNotIn("quota exhausted", str(raised.exception))
 
     def test_terminal_asks_questions_and_displays_sources(self) -> None:
         def fake_llm(prompt: str) -> str:

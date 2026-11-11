@@ -29,6 +29,16 @@ COMMAND_ARGUMENTS = {
     "LIST_DOCS": (),
 }
 _PLACEHOLDERS = {"$SEARCH_RESULTS", "$ANSWER", "$ANSWER_SOURCES"}
+OPENROUTER_RATE_LIMIT_MESSAGE = (
+    "The AI service is busy right now. Please wait a moment and try again."
+)
+
+
+class OpenRouterRateLimitError(RuntimeError):
+    """A provider rate limit with a safe user-facing message."""
+
+    def __init__(self) -> None:
+        super().__init__(OPENROUTER_RATE_LIMIT_MESSAGE)
 
 
 @dataclass(frozen=True)
@@ -122,11 +132,7 @@ class OpenRouterClient:
                     if attempt < self.max_retries:
                         time.sleep(self.retry_delay)
                         continue
-                    suffix = f" Details: {detail}" if detail else ""
-                    raise RuntimeError(
-                        "OpenRouter rate limit reached (HTTP 429). "
-                        f"Please wait before trying again.{suffix}"
-                    ) from exc
+                    raise OpenRouterRateLimitError() from exc
                 raise RuntimeError(
                     f"OpenRouter returned HTTP {exc.code}: {detail}"
                 ) from exc

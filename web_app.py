@@ -20,7 +20,13 @@ from pydantic import BaseModel, Field
 
 from audit_log import AuditLogger
 from dsl_executor import SUPPORTED_DOCUMENT_SUFFIXES
-from faq_agent import DEFAULT_MODEL, FAQAgent, Operation, OperationExecutionError
+from faq_agent import (
+    DEFAULT_MODEL,
+    FAQAgent,
+    OpenRouterRateLimitError,
+    Operation,
+    OperationExecutionError,
+)
 from session_store import (
     DEFAULT_MAX_SESSIONS,
     SessionLimitExceeded,
@@ -458,6 +464,8 @@ def create_app(
         try:
             result = faq_agent.ask(question)
         except OperationExecutionError as exc:
+            if isinstance(exc.__cause__, OpenRouterRateLimitError):
+                return _upstream_rate_limit_response()
             elapsed_ms = (time.perf_counter() - started) * 1000
             return JSONResponse(
                 status_code=502,
@@ -473,6 +481,8 @@ def create_app(
                     },
                 },
             )
+        except OpenRouterRateLimitError:
+            return _upstream_rate_limit_response()
         except (RuntimeError, ValueError, OSError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -644,6 +654,14 @@ def _rate_limited_response(retry_after: int) -> JSONResponse:
             "detail": "You're making requests too quickly. Please wait a moment and try again."
         },
         headers={"Retry-After": str(retry_after)},
+    )
+
+
+def _upstream_rate_limit_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "The AI service is busy right now. Please wait a moment and try again."},
+        headers={"Retry-After": "30"},
     )
 
 

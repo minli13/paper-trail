@@ -8,7 +8,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from audit_log import AuditLogger
-from faq_agent import FAQAgent
+from faq_agent import FAQAgent, OpenRouterRateLimitError
 from web_app import create_app
 
 
@@ -260,6 +260,35 @@ class WebAppTests(unittest.TestCase):
         )
         self.assertIn("RuntimeError", body["operations"][1]["feedback"])
         self.assertGreaterEqual(body["timings"]["total_ms"], 0)
+
+    def test_api_returns_friendly_429_for_upstream_rate_limit(self) -> None:
+        def rate_limited_llm(_: str) -> str:
+            raise OpenRouterRateLimitError()
+
+        agent = FAQAgent(
+            self.sample_documents_dir,
+            self.root / "rate-limit-notes",
+            llm_call=rate_limited_llm,
+        )
+        client = TestClient(
+            create_app(
+                agent,
+                audit_logger=AuditLogger(self.root / "rate-limit-audit.jsonl"),
+                sample_documents_dir=self.sample_documents_dir,
+                data_dir=self.root / "rate-limit-data",
+            )
+        )
+        try:
+            response = client.post("/api/ask", json={"question": "How long?"})
+        finally:
+            client.close()
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(
+            response.json()["detail"],
+            "The AI service is busy right now. Please wait a moment and try again.",
+        )
+        self.assertEqual(response.headers["retry-after"], "30")
 
     def test_note_preview_does_not_save_until_confirmed(self) -> None:
         note = {
