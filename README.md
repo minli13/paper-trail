@@ -5,6 +5,12 @@ OpenRouter model to answer using matching passages, and reports the source
 files. It can also preview and save an answer as a Markdown note after
 confirmation.
 
+## Try it online
+
+The app is deployed on Render: <https://paper-trail-l109.onrender.com/>.
+Documents and notes in the deployed app are temporary and may be cleared when
+the service restarts or redeploys. Download any notes you want to keep.
+
 ## Requirements
 
 - Python 3.10 or later
