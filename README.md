@@ -53,11 +53,21 @@ The web app stores each browser session separately under
 It seeds each new session with the three sample documents in `documents/`.
 Uploaded `.md`, `.rst`, and `.txt` files must be UTF-8 text and are limited to
 5 MB each, 50 supported documents per session, and 25 MB total document storage
-per session. The sample documents count toward those limits.
+per session. The sample documents count toward those limits. Confirmed notes are
+limited to 100 files and 5 MB total per session.
 
 Session cookies are HttpOnly and SameSite=Lax. They identify a browser session,
-not a user account. Sessions are removed after three idle hours by default;
-override the timeout and local data root with:
+not a user account. The session is created on the first API request (not for the
+homepage, static assets, or `/healthz`). At most 300 active session directories
+are allowed per app instance; new session requests receive HTTP 503 when the cap
+is reached. Idle sessions are removed after three hours by default. Override
+the timeout and local data root with:
+
+The API also applies an in-memory sliding-window limit of 10 requests per
+minute per session and per client IP. When deployed behind a proxy, configure
+the proxy to overwrite or sanitize `X-Forwarded-For`; the app uses its first IP
+address as the client IP. Excess requests receive HTTP 429 and a `Retry-After`
+header. These limits are per app instance.
 
 ```powershell
 $env:FAQ_SESSION_IDLE_HOURS = "3"
@@ -139,12 +149,17 @@ API; the OpenRouter key remains on the server and is read from
 
 ## Audit logging
 
-The app appends structured JSON Lines events to `logs/audit.jsonl` by default.
-Set `FAQ_AUDIT_LOG` to change the log file path. HTTP requests (including
-failures), FAQ asks, DSL command execution, and note save/confirmation outcomes
-are recorded with UTC timestamps and status metadata. The log intentionally
-does not include API keys, prompts, questions, answers, or document contents.
-Audit logs are excluded from Git by `.gitignore`.
+The app writes structured JSON Lines events to both stdout and
+`logs/audit.jsonl` by default. Stdout makes events available in Render's log
+stream when the instance-local filesystem is unavailable or reset. Set
+`FAQ_AUDIT_LOG` to change the file path. HTTP requests (including failures), FAQ
+asks, DSL command execution, and note save/confirmation outcomes are recorded
+with UTC timestamps and status metadata. Each event includes a request ID and a
+SHA-256 hash of the session ID when the session is known, so events from one
+request and session can be correlated without logging the session cookie.
+These hashes are stable pseudonymous identifiers, not anonymized data. The log
+intentionally excludes API keys, prompts, questions, answers, and document
+contents. Audit logs are excluded from Git by `.gitignore`.
 
 ## Run the tests
 

@@ -16,6 +16,11 @@ DEFAULT_SAMPLE_DOCUMENTS = (
     "security-faq.md",
     "travel-policy.txt",
 )
+DEFAULT_MAX_SESSIONS = 300
+
+
+class SessionLimitExceeded(RuntimeError):
+    """Raised when creating another session would exceed the configured cap."""
 
 
 @dataclass(frozen=True)
@@ -35,18 +40,21 @@ class SessionStore:
         data_dir: str | Path,
         sample_documents_dir: str | Path,
         idle_timeout_seconds: float = 3 * 60 * 60,
+        max_sessions: int = DEFAULT_MAX_SESSIONS,
     ) -> None:
         if idle_timeout_seconds <= 0:
             raise ValueError("idle_timeout_seconds must be positive")
+        if max_sessions <= 0:
+            raise ValueError("max_sessions must be positive")
         self.root = Path(data_dir).resolve() / "sessions"
         self.sample_documents_dir = Path(sample_documents_dir).resolve()
         self.idle_timeout_seconds = idle_timeout_seconds
+        self.max_sessions = max_sessions
         self._lock = threading.RLock()
 
     def open_session(self, cookie_value: str | None = None) -> UserSession:
         """Resolve a cookie UUID or create a fresh, sample-seeded session."""
         with self._lock:
-            self.cleanup_idle()
             session_id = self._normalize_id(cookie_value)
             session_root = self.root / session_id
             is_new = not session_root.exists()
@@ -55,6 +63,13 @@ class SessionStore:
                 session_id = str(uuid.uuid4())
                 session_root = self.root / session_id
                 is_new = True
+
+            if is_new:
+                self.root.mkdir(parents=True, exist_ok=True)
+                if self._session_count() >= self.max_sessions:
+                    raise SessionLimitExceeded(
+                        f"Session limit reached ({self.max_sessions}). Try again later."
+                    )
 
             documents_dir = session_root / "documents"
             notes_dir = session_root / "notes"
@@ -70,6 +85,18 @@ class SessionStore:
                 notes_dir=notes_dir,
                 is_new=is_new,
             )
+
+    def _session_count(self) -> int:
+        count = 0
+        for entry in self.root.iterdir():
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            try:
+                uuid.UUID(entry.name)
+            except ValueError:
+                continue
+            count += 1
+        return count
 
     def touch(self, session: UserSession) -> None:
         with self._lock:

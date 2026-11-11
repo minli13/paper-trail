@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import sys
 import threading
+from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
@@ -15,6 +18,22 @@ class AuditLogger:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self._lock = threading.Lock()
+        self._context: ContextVar[dict[str, str]] = ContextVar(
+            f"audit_context_{id(self)}",
+            default={},
+        )
+
+    def set_context(self, request_id: str, session_id: str | None = None) -> Token:
+        """Bind request and privacy-preserving session identifiers to this context."""
+        values = {"request_id": request_id}
+        if session_id:
+            values["session_id_hash"] = hashlib.sha256(
+                session_id.encode("utf-8")
+            ).hexdigest()
+        return self._context.set(values)
+
+    def reset_context(self, token: Token) -> None:
+        self._context.reset(token)
 
     def log(
         self,
@@ -28,6 +47,7 @@ class AuditLogger:
             "action": action,
             "outcome": outcome,
         }
+        event.update(self._context.get())
         if metadata:
             event["metadata"] = dict(metadata)
 
@@ -36,3 +56,5 @@ class AuditLogger:
         with self._lock:
             with self.path.open("a", encoding="utf-8", newline="\n") as log_file:
                 log_file.write(encoded)
+            sys.stdout.write(encoded)
+            sys.stdout.flush()

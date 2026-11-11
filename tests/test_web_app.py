@@ -80,6 +80,35 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("/api/ask", script.text)
         self.assertIn("Actions taken", script.text)
 
+    def test_public_assets_and_health_check_do_not_create_or_audit_sessions(self) -> None:
+        audit_path = self.root / "bypass-audit.jsonl"
+        client = TestClient(
+            create_app(
+                audit_logger=AuditLogger(audit_path),
+                sample_documents_dir=self.sample_documents_dir,
+                data_dir=self.root / "bypass-data",
+            )
+        )
+        try:
+            responses = [
+                client.get("/"),
+                client.get("/static/app.js"),
+                client.get("/healthz"),
+            ]
+
+            self.assertEqual([response.status_code for response in responses], [200] * 3)
+            self.assertEqual(responses[2].text, "ok")
+            self.assertTrue(all("paper_trail_session" not in response.cookies for response in responses))
+            self.assertFalse((self.root / "bypass-data" / "sessions").exists())
+            self.assertFalse(audit_path.exists())
+
+            api_response = client.get("/api/documents")
+            self.assertEqual(api_response.status_code, 200)
+            self.assertIn("paper_trail_session", client.cookies)
+            self.assertTrue((self.root / "bypass-data" / "sessions").is_dir())
+        finally:
+            client.close()
+
     def test_documents_and_ask_api(self) -> None:
         documents = self.client.get("/api/documents")
         response = self.client.post(
@@ -134,6 +163,34 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("faq.ask", actions)
         self.assertIn("dsl.command", actions)
         self.assertIn("http.request", actions)
+        ask_events = [
+            event
+            for event in events
+            if event.get("request_id")
+            and (
+                event["action"] in {"faq.ask", "dsl.command"}
+                or (
+                    event["action"] == "http.request"
+                    and event.get("metadata", {}).get("path") == "/api/ask"
+                )
+            )
+        ]
+        self.assertTrue(ask_events)
+        self.assertEqual(len({event["request_id"] for event in ask_events}), 1)
+        self.assertEqual(len({event["session_id_hash"] for event in ask_events}), 1)
+        session_id = self.client.cookies.get("paper_trail_session")
+        self.assertNotIn(session_id, audit_contents)
+        self.assertEqual(len(ask_events[0]["session_id_hash"]), 64)
+        ask_http_response = next(
+            event["request_id"]
+            for event in ask_events
+            if event["action"] == "http.request"
+            and event.get("metadata", {}).get("path") == "/api/ask"
+        )
+        self.assertEqual(
+            response.headers["x-request-id"],
+            ask_http_response,
+        )
         self.assertNotIn("How long should records be kept?", audit_contents)
         self.assertNotIn("Keep records for seven years. [1]", audit_contents)
 
@@ -248,6 +305,59 @@ class WebAppTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422)
         self.assertIn("Unknown source", response.json()["detail"])
+
+    def test_confirmed_notes_obey_per_session_count_and_storage_caps(self) -> None:
+        note = {
+            "title": "Retention",
+            "content": "Keep records for seven years.",
+            "sources": ["employee-handbook.md"],
+        }
+        with patch("web_app.MAX_SESSION_NOTES", 1):
+            preview = self.client.post("/api/notes", json=note)
+            self.assertEqual(preview.status_code, 200)
+            self.assertFalse(preview.json()["saved"])
+
+            first = self.client.post(
+                "/api/notes",
+                json={**note, "confirmed": True},
+            )
+            over_limit = self.client.post(
+                "/api/notes",
+                json={**note, "title": "Another note", "confirmed": True},
+            )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertTrue(first.json()["saved"])
+        self.assertEqual(over_limit.status_code, 413)
+        self.assertIn("note limit", over_limit.json()["detail"])
+        self.assertEqual(len(list((self.session_dir() / "notes").glob("*.md"))), 1)
+
+        other_client = TestClient(self.client.app)
+        try:
+            isolated = other_client.post(
+                "/api/notes",
+                json={**note, "confirmed": True},
+            )
+            self.assertEqual(isolated.status_code, 200)
+            self.assertTrue(isolated.json()["saved"])
+        finally:
+            other_client.close()
+
+    def test_confirmed_note_storage_limit_is_checked_before_writing(self) -> None:
+        with patch("web_app.MAX_SESSION_NOTE_STORAGE_BYTES", 10):
+            response = self.client.post(
+                "/api/notes",
+                json={
+                    "title": "Retention",
+                    "content": "Keep records for seven years.",
+                    "sources": ["employee-handbook.md"],
+                    "confirmed": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 413)
+        self.assertIn("storage limit", response.json()["detail"])
+        self.assertFalse(list((self.session_dir() / "notes").glob("*.md")))
 
     def test_document_upload_adds_utf8_text_to_library(self) -> None:
         response = self.client.post(
@@ -433,6 +543,90 @@ class WebAppTests(unittest.TestCase):
                 files={"file": ("too-large-for-session.md", b"content", "text/markdown")},
             )
         self.assertEqual(size_limited.status_code, 413)
+
+    def test_new_sessions_are_rejected_with_503_above_global_cap(self) -> None:
+        with patch("web_app.MAX_ACTIVE_SESSIONS", 1):
+            app = create_app(
+                audit_logger=AuditLogger(self.root / "capped-audit.jsonl"),
+                sample_documents_dir=self.sample_documents_dir,
+                data_dir=self.root / "capped-data",
+            )
+        first_client = TestClient(app)
+        second_client = TestClient(app)
+        try:
+            created = first_client.get("/api/documents")
+            rejected = second_client.get("/api/documents")
+
+            self.assertEqual(created.status_code, 200)
+            self.assertEqual(rejected.status_code, 503)
+            self.assertIn("Session limit reached", rejected.json()["detail"])
+            self.assertNotIn("paper_trail_session", second_client.cookies)
+            self.assertEqual(
+                len(list((self.root / "capped-data" / "sessions").iterdir())),
+                1,
+            )
+        finally:
+            first_client.close()
+            second_client.close()
+
+    def test_api_requests_are_limited_per_session(self) -> None:
+        with patch("web_app.RATE_LIMIT_REQUESTS", 2):
+            app = create_app(
+                audit_logger=AuditLogger(self.root / "session-rate-audit.jsonl"),
+                sample_documents_dir=self.sample_documents_dir,
+                data_dir=self.root / "session-rate-data",
+            )
+        client = TestClient(app)
+        try:
+            first = client.get(
+                "/api/documents",
+                headers={"X-Forwarded-For": "192.0.2.1"},
+            )
+            second = client.get(
+                "/api/documents",
+                headers={"X-Forwarded-For": "192.0.2.2"},
+            )
+            limited = client.get(
+                "/api/documents",
+                headers={"X-Forwarded-For": "192.0.2.3"},
+            )
+
+            self.assertEqual([first.status_code, second.status_code], [200, 200])
+            self.assertEqual(limited.status_code, 429)
+            self.assertIn("wait a moment", limited.json()["detail"])
+            self.assertEqual(limited.headers["retry-after"], "60")
+        finally:
+            client.close()
+
+    def test_api_requests_are_limited_per_forwarded_ip_across_sessions(self) -> None:
+        with patch("web_app.RATE_LIMIT_REQUESTS", 2):
+            app = create_app(
+                audit_logger=AuditLogger(self.root / "ip-rate-audit.jsonl"),
+                sample_documents_dir=self.sample_documents_dir,
+                data_dir=self.root / "ip-rate-data",
+            )
+        clients = [TestClient(app) for _ in range(3)]
+        try:
+            responses = [
+                client.get(
+                    "/api/documents",
+                    headers={"X-Forwarded-For": "203.0.113.42, 10.0.0.5"},
+                )
+                for client in clients
+            ]
+
+            self.assertEqual(
+                [response.status_code for response in responses],
+                [200, 200, 429],
+            )
+            self.assertEqual(responses[2].headers["retry-after"], "60")
+            self.assertEqual(
+                len(list((self.root / "ip-rate-data" / "sessions").iterdir())),
+                2,
+            )
+        finally:
+            for client in clients:
+                client.close()
 
 
 if __name__ == "__main__":

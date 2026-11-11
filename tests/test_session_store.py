@@ -4,7 +4,7 @@ import time
 import unittest
 from pathlib import Path
 
-from session_store import SessionStore
+from session_store import SessionLimitExceeded, SessionStore
 
 
 class SessionStoreTests(unittest.TestCase):
@@ -56,6 +56,29 @@ class SessionStoreTests(unittest.TestCase):
         self.assertFalse(expired.root.exists())
         self.assertTrue(active.root.exists())
         self.assertTrue(unrelated.exists())
+
+    def test_open_session_does_not_run_idle_cleanup(self) -> None:
+        expired = self.store.open_session()
+        expired_at = time.time() - 7200
+        os.utime(expired.root / ".last_activity", (expired_at, expired_at))
+
+        self.store.open_session()
+
+        self.assertTrue(expired.root.exists())
+
+    def test_open_session_refuses_new_session_at_global_cap(self) -> None:
+        capped_store = SessionStore(
+            self.root / "capped-data",
+            self.sample_documents_dir,
+            idle_timeout_seconds=3600,
+            max_sessions=1,
+        )
+        capped_store.open_session()
+
+        with self.assertRaises(SessionLimitExceeded):
+            capped_store.open_session()
+
+        self.assertEqual(len(list(capped_store.root.iterdir())), 1)
 
 
 if __name__ == "__main__":

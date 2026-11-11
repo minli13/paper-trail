@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from contextlib import asynccontextmanager, suppress
+from ipaddress import ip_address
 import os
 from pathlib import Path
+import threading
 import time
+import uuid
 from urllib.parse import urlencode
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
@@ -17,7 +21,12 @@ from pydantic import BaseModel, Field
 from audit_log import AuditLogger
 from dsl_executor import SUPPORTED_DOCUMENT_SUFFIXES
 from faq_agent import DEFAULT_MODEL, FAQAgent, Operation, OperationExecutionError
-from session_store import SessionStore, UserSession
+from session_store import (
+    DEFAULT_MAX_SESSIONS,
+    SessionLimitExceeded,
+    SessionStore,
+    UserSession,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -25,6 +34,11 @@ STATIC_DIR = PROJECT_ROOT / "static"
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_SESSION_DOCUMENTS = 50
 MAX_SESSION_STORAGE_BYTES = 25 * 1024 * 1024
+MAX_SESSION_NOTES = 100
+MAX_SESSION_NOTE_STORAGE_BYTES = 5 * 1024 * 1024
+MAX_ACTIVE_SESSIONS = DEFAULT_MAX_SESSIONS
+RATE_LIMIT_REQUESTS = 10
+RATE_LIMIT_WINDOW_SECONDS = 60
 SESSION_COOKIE_NAME = "paper_trail_session"
 
 
@@ -37,6 +51,62 @@ class SaveNoteRequest(BaseModel):
     content: str = Field(min_length=1, max_length=20000)
     sources: list[str] = Field(default_factory=list, max_length=30)
     confirmed: bool = False
+
+
+class RequestRateLimiter:
+    """In-memory sliding-window limits keyed by client IP and session ID."""
+
+    def __init__(
+        self,
+        limit: int = RATE_LIMIT_REQUESTS,
+        window_seconds: float = RATE_LIMIT_WINDOW_SECONDS,
+        max_keys: int = 20_000,
+    ) -> None:
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self.max_keys = max_keys
+        self._events: dict[tuple[str, str], deque[float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, category: str, identity: str) -> tuple[bool, int]:
+        now = time.monotonic()
+        key = (category, identity)
+        with self._lock:
+            timestamps = self._events.get(key)
+            if timestamps is not None:
+                self._discard_expired(timestamps, now)
+                if not timestamps:
+                    del self._events[key]
+                    timestamps = None
+
+            if timestamps is None:
+                if len(self._events) >= self.max_keys:
+                    self._discard_all_expired(now)
+                if len(self._events) >= self.max_keys:
+                    return False, int(self.window_seconds)
+                timestamps = deque()
+                self._events[key] = timestamps
+
+            if len(timestamps) >= self.limit:
+                retry_after = max(
+                    1,
+                    int(timestamps[0] + self.window_seconds - now + 0.999),
+                )
+                return False, retry_after
+
+            timestamps.append(now)
+            return True, 0
+
+    def _discard_expired(self, timestamps: deque[float], now: float) -> None:
+        cutoff = now - self.window_seconds
+        while timestamps and timestamps[0] <= cutoff:
+            timestamps.popleft()
+
+    def _discard_all_expired(self, now: float) -> None:
+        for key, timestamps in list(self._events.items()):
+            self._discard_expired(timestamps, now)
+            if not timestamps:
+                del self._events[key]
 
 
 def create_app(
@@ -52,6 +122,7 @@ def create_app(
         or os.environ.get("FAQ_DATA_DIR", str(PROJECT_ROOT / "data")),
         sample_documents_dir=sample_documents_dir or PROJECT_ROOT / "documents",
         idle_timeout_seconds=idle_timeout_seconds,
+        max_sessions=MAX_ACTIVE_SESSIONS,
     )
     cleanup_interval_seconds = max(
         60.0, min(idle_timeout_seconds / 4, 15 * 60)
@@ -60,6 +131,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         async def cleanup_loop() -> None:
+            await asyncio.to_thread(store.cleanup_idle)
             while True:
                 await asyncio.sleep(cleanup_interval_seconds)
                 await asyncio.to_thread(store.cleanup_idle)
@@ -83,6 +155,11 @@ def create_app(
     app.state.agent_prototype = agent
     app.state.session_store = store
     app.state.audit_logger = audit
+    app.state.note_quota_lock = threading.Lock()
+    app.state.rate_limiter = RequestRateLimiter(
+        limit=RATE_LIMIT_REQUESTS,
+        window_seconds=RATE_LIMIT_WINDOW_SECONDS,
+    )
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     def session_agent(session: UserSession) -> FAQAgent:
@@ -97,10 +174,130 @@ def create_app(
 
     @app.middleware("http")
     async def audit_requests(request, call_next):
+        path = request.url.path
+        if path in {"/", "/healthz"} or path == "/static" or path.startswith(
+            "/static/"
+        ):
+            return await call_next(request)
+
+        request_id = uuid.uuid4().hex
+        request.state.request_id = request_id
+        session_cookie = _valid_session_id_cookie(
+            request.cookies.get(SESSION_COOKIE_NAME)
+        )
+        context_token = audit.set_context(request_id, session_cookie)
+        try:
+            response = await _handle_audited_request(request, call_next, path)
+            response.headers["X-Request-ID"] = request_id
+            return response
+        finally:
+            audit.reset_context(context_token)
+
+    async def _handle_audited_request(request, call_next, path: str):
         started = time.monotonic()
         status_code = 500
         outcome = "failure"
-        session = store.open_session(request.cookies.get(SESSION_COOKIE_NAME))
+        limiter: RequestRateLimiter = app.state.rate_limiter
+        if path.startswith("/api/"):
+            client_ip = _client_ip(request)
+            allowed, retry_after = limiter.allow("ip", client_ip)
+            if not allowed:
+                await asyncio.to_thread(
+                    audit.log,
+                    "http.request",
+                    "rate_limited",
+                    {
+                        "method": request.method,
+                        "path": path,
+                        "status_code": 429,
+                        "limit_scope": "ip",
+                    },
+                )
+                return _rate_limited_response(retry_after)
+
+        try:
+            session = await asyncio.to_thread(
+                store.open_session,
+                request.cookies.get(SESSION_COOKIE_NAME),
+            )
+        except SessionLimitExceeded as exc:
+            await asyncio.to_thread(
+                audit.log,
+                "http.request",
+                "failure",
+                {
+                    "method": request.method,
+                    "path": path,
+                    "status_code": 503,
+                    "duration_ms": round((time.monotonic() - started) * 1000, 2),
+                },
+            )
+            return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+        session_context_token = audit.set_context(
+            request.state.request_id,
+            session.session_id,
+        )
+        try:
+            return await _handle_session_request(
+                request,
+                call_next,
+                path,
+                session,
+                started,
+                status_code,
+                outcome,
+                idle_timeout_seconds,
+                audit,
+                store,
+                limiter,
+            )
+        finally:
+            audit.reset_context(session_context_token)
+
+    async def _handle_session_request(
+        request,
+        call_next,
+        path: str,
+        session: UserSession,
+        started: float,
+        status_code: int,
+        outcome: str,
+        idle_timeout: float,
+        audit_logger: AuditLogger,
+        session_store: SessionStore,
+        limiter: RequestRateLimiter,
+    ):
+        if path.startswith("/api/"):
+            allowed, retry_after = limiter.allow("session", session.session_id)
+            if not allowed:
+                response = _rate_limited_response(retry_after)
+                response.set_cookie(
+                    SESSION_COOKIE_NAME,
+                    session.session_id,
+                    max_age=int(idle_timeout),
+                    httponly=True,
+                    samesite="lax",
+                    secure=os.environ.get("FAQ_COOKIE_SECURE", "false").casefold()
+                    in {"1", "true", "yes"},
+                    path="/",
+                )
+                status_code = 429
+                outcome = "rate_limited"
+                await asyncio.to_thread(
+                    audit_logger.log,
+                    "http.request",
+                    outcome,
+                    {
+                        "method": request.method,
+                        "path": path,
+                        "status_code": status_code,
+                        "limit_scope": "session",
+                    },
+                )
+                await asyncio.to_thread(session_store.touch, session)
+                return response
+
         request.state.user_session = session
         try:
             response = await call_next(request)
@@ -109,7 +306,7 @@ def create_app(
             response.set_cookie(
                 SESSION_COOKIE_NAME,
                 session.session_id,
-                max_age=int(idle_timeout_seconds),
+                max_age=int(idle_timeout),
                 httponly=True,
                 samesite="lax",
                 secure=os.environ.get("FAQ_COOKIE_SECURE", "false").casefold()
@@ -118,13 +315,14 @@ def create_app(
             )
             return response
         finally:
-            store.touch(session)
-            audit.log(
+            await asyncio.to_thread(session_store.touch, session)
+            await asyncio.to_thread(
+                audit_logger.log,
                 "http.request",
                 outcome,
                 {
                     "method": request.method,
-                    "path": request.url.path,
+                    "path": path,
                     "status_code": status_code,
                     "duration_ms": round((time.monotonic() - started) * 1000, 2),
                 },
@@ -139,6 +337,10 @@ def create_app(
     @app.get("/", include_in_schema=False)
     def index() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
+
+    @app.get("/healthz", include_in_schema=False, response_class=Response)
+    def health_check() -> Response:
+        return Response(content="ok", media_type="text/plain")
 
     @app.get("/api/documents")
     def list_documents(request: Request) -> dict[str, list[str]]:
@@ -315,12 +517,33 @@ def create_app(
                     status_code=422,
                     detail=f"Unknown source document(s): {', '.join(unknown_sources)}",
                 )
-            result = faq_agent.executor.save_note(
-                title,
-                content,
-                body.sources,
-                confirm_callback=lambda _: body.confirmed,
-            )
+            if body.confirmed:
+                preview_size = _note_preview_size(title, content, body.sources)
+                with app.state.note_quota_lock:
+                    note_count, note_size = _session_note_usage(notes_root(request.state.user_session))
+                    if note_count >= MAX_SESSION_NOTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"Session note limit reached ({MAX_SESSION_NOTES} notes)",
+                        )
+                    if note_size + preview_size > MAX_SESSION_NOTE_STORAGE_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="Session note storage limit is 5 MB",
+                        )
+                    result = faq_agent.executor.save_note(
+                        title,
+                        content,
+                        body.sources,
+                        confirm_callback=lambda _: True,
+                    )
+            else:
+                result = faq_agent.executor.save_note(
+                    title,
+                    content,
+                    body.sources,
+                    confirm_callback=lambda _: False,
+                )
         except HTTPException:
             raise
         except (OSError, ValueError, TypeError) as exc:
@@ -365,6 +588,63 @@ def _operation_payload(operation: Operation) -> dict[str, object]:
         "feedback": operation.feedback,
         "duration_ms": round(operation.duration_ms, 2),
     }
+
+
+def _session_note_usage(notes_dir: Path) -> tuple[int, int]:
+    """Return regular-file count and byte size without following symlinks."""
+    if not notes_dir.is_dir():
+        return 0, 0
+    count = 0
+    total_bytes = 0
+    for path in notes_dir.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        count += 1
+        total_bytes += path.stat().st_size
+    return count, total_bytes
+
+
+def _note_preview_size(title: str, content: str, sources: list[str]) -> int:
+    source_names = list(dict.fromkeys(source.strip() for source in sources))
+    source_list = "\n".join(f"- {source}" for source in source_names) or "- None"
+    preview = f"# {title}\n\n{content}\n\nSources:\n{source_list}\n"
+    return len(preview.encode("utf-8"))
+
+
+def _client_ip(request: Request) -> str:
+    """Use the first forwarded address, falling back to the socket peer."""
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    if forwarded_for:
+        first_address = forwarded_for.split(",", 1)[0].strip()
+        try:
+            return str(ip_address(first_address))
+        except ValueError:
+            pass
+    if request.client is not None:
+        try:
+            return str(ip_address(request.client.host))
+        except ValueError:
+            return request.client.host
+    return "unknown"
+
+
+def _valid_session_id_cookie(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        return None
+
+
+def _rate_limited_response(retry_after: int) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={
+            "detail": "You're making requests too quickly. Please wait a moment and try again."
+        },
+        headers={"Retry-After": str(retry_after)},
+    )
 
 
 app = create_app()
